@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // var mu sync.Locker
@@ -45,6 +46,7 @@ type TaskHolder struct {
 }
 
 type TaskInfo struct {
+	StartTime  time.Time  // 任务开始的时间
 	TaskStatus TaskStatus // 当前task的状态 有三种 正在执行 等待被执行 执行完毕
 	TaskAddr   *Task      // 当前task的地址
 }
@@ -110,7 +112,35 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.makeMapTasks(files)
 	c.server()
+
+	go c.CrashDetector()
 	return &c
+}
+
+func (c *Coordinator) CrashDetector() {
+	for {
+		time.Sleep(time.Second * 2)
+		if c.DistPhase == Alldone { // 如果都做完了 那就结束
+			break
+		}
+
+		for _, taskInfo := range c.TaskHolder.Meta { // 遍历每一个任务 看它们的启动时间距离现在多久
+			if taskInfo.TaskStatus == Operating {
+				fmt.Printf("Task %d is working\n", taskInfo.TaskAddr.TaskId)
+			}
+			if taskInfo.TaskStatus == Operating && time.Since(taskInfo.StartTime) > time.Second*9 {
+				fmt.Printf("Task %d crashed, and it is a %d task\n", taskInfo.TaskAddr.TaskId, taskInfo.TaskAddr.TaskType)
+
+				if taskInfo.TaskAddr.TaskType == MapTask {
+					taskInfo.TaskStatus = Waiting
+					c.MapTaskChannel <- taskInfo.TaskAddr
+				} else if taskInfo.TaskAddr.TaskType == ReduceTask {
+					taskInfo.TaskStatus = Waiting
+					c.ReduceTaskChannel <- taskInfo.TaskAddr
+				}
+			}
+		}
+	}
 }
 
 // 对传进来的files进行处理，将每一个文件名都初始化成一个map task
@@ -225,6 +255,7 @@ func (c *Coordinator) getTaskStatus(taskId int) TaskStatus {
 
 func (c *Coordinator) setTaskStatus(taskId int) {
 	c.TaskHolder.Meta[taskId].TaskStatus = Operating
+	c.TaskHolder.Meta[taskId].StartTime = time.Now() // 初始化开始时间
 }
 
 func (c *Coordinator) checkAllTaskDone() bool { // 检查是不是所有当前阶段的任务都完成了 这里的任务只有两种状态 一种是正在执行 一种是已经做完了 不可能有等待执行的任务
