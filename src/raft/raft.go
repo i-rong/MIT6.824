@@ -20,7 +20,7 @@ package raft
 import (
 	//	"bytes"
 
-	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +79,7 @@ type Raft struct {
 }
 
 type LogEntry struct { // 如论文中所说 一个log entry是一个box 里面包含了这个entry的term和command
+	index   int
 	term    int
 	command interface{}
 }
@@ -287,18 +288,36 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// 如果是electionTimer时间到 那么就开启新一轮选举
+// 如果是heartbeat时间到 并且是leader 那么就发起新的一轮心跳
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		nowTime := time.Now()                  // 记录当前的时间
-		if nowTime.After(rf.electionTimeout) { // 如果超时了
-			fmt.Printf("server %d time out, become a candidate.\n", rf.me)
+		select {
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			rf.status = Candidate               // 进入新的阶段 server变成candidate
+			rf.currentTerm = rf.currentTerm + 1 // 新的一轮选举 term自增
+			rf.StartElection()                  // 开始选举
+			rf.electionTimer.Reset(RandomElectionTimeout())
+			rf.mu.Unlock()
+		case <-rf.heartbeatTimer.C:
+			rf.mu.Lock()
+			if rf.status == Leader { // 如果是leader
+				// rf.BroadCastHaertbeat(true)
+				rf.heartbeatTimer.Reset((StableHeartbeatTimeout()))
+			}
+			rf.mu.Unlock()
 		}
-		// 睡完之后 发现自己的voteTime没有被其他的server改变 说明自己该变成candidate了
-
-		// Your code here (2A)
-		// Check if a leader election should be started.
-
 	}
+}
+
+func (rf *Raft) StartElection() {
+	request := genRequestVote()
+	DPrintf("{Node: %v} starts election with Request %v", rf.me, request)
+}
+
+func (rf *Raft) BroadCastHaertbeat(is bool) {
+
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -329,6 +348,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	lastEntry := rf.getLastEntry()    // 获取当前server的最后一个entry
+	for i := 0; i < len(peers); i++ { // 循环遍历每一个服务器
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = lastEntry.index + 1
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -336,15 +360,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+func (rf *Raft) getLastEntry() LogEntry {
+	return rf.logs[len(rf.logs)-1]
+}
+
 func StableHeartbeatTimeout() time.Duration {
-	var ret time.Duration
-	ret = 50 * time.Millisecond
+	ret := 50 * time.Millisecond
 	return ret
 }
 
 func RandomElectionTimeout() time.Duration {
-	var ret time.Duration
-	ms := 50 + rand(int64) % 300
-	ret = 
+	ms := 50 + (rand.Int63() % 300)
+	ret := time.Duration(ms) * time.Millisecond
 	return ret
 }
