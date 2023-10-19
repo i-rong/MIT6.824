@@ -51,8 +51,8 @@ type ApplyMsg struct {
 }
 
 const (
-	ElectionTimeout   = time.Millisecond * 300
-	HeartBeatInterval = time.Millisecond * 150
+	ElectionTimeout   = time.Millisecond * 150
+	HeartBeatInterval = time.Millisecond * 50
 )
 
 // A Go object implementing a single Raft peer.
@@ -80,12 +80,11 @@ type Raft struct {
 	// 讲道理 heartbeat应该比election时间要短
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
-	// 为什么这里用指针 之后再看看
 }
 
 type LogEntry struct { // 如论文中所说 一个log entry是一个box 里面包含了这个entry的term和command
-	term    int
-	command interface{}
+	Term    int
+	Command interface{}
 }
 
 type ServerType int
@@ -182,10 +181,44 @@ type AppendEntriesReply struct {
 }
 
 // example RequestVote RPC handler.
+// args是candidate rf是授予投票的服务器
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	if rf.currentTerm > args.Term {
+		return
+	}
+
+	if rf.currentTerm == args.Term && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.status = Follower
+	}
+
+	rf.votedFor = args.CandidateId
+	rf.electionTimer.Reset(rf.getElectionTimeout())
+	reply.Term, reply.VoteGranted = rf.currentTerm, true
 }
+
+// func (rf *Raft) isLogUpToDate(lastLogIndex int, lastLogTerm int) bool {
+// 	return true
+// }
+
+// func (rf *Raft) isLogUpToDate(lastLogIndex int, lastLogTerm int) bool {
+// 	ret := false
+// 	if lastLogIndex == len(rf.logs)-1 && lastLogTerm == rf.logs[len(rf.logs)-1].Term {
+// 		ret = true
+// 	}
+// 	return ret
+// }
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -263,7 +296,7 @@ func (rf *Raft) killed() bool {
 // 如果是electionTimer时间到 那么就开启新一轮选举
 // 如果是heartbeat时间到 并且是leader 那么就发起新的一轮心跳
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
@@ -275,21 +308,27 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
 			if rf.status == Leader { // 只有是leader才发送心跳包
-				rf.BraodCastHeartBeat(true)
-				rf.heartbeatTimer.Reset(HeartBeatInterval)
+				rf.BroadCastHeartBeat(true)
 			}
 			rf.mu.Unlock()
 		}
 	}
 }
 
-func (rf *Raft) BraodCastHeartBeat(isHeartBeat bool) {
+func (rf *Raft) BroadCastHeartBeat(isHeartBeat bool) {
 	for peer := range rf.peers {
 		if peer == rf.me {
+			rf.heartbeatTimer.Reset(HeartBeatInterval)
+			rf.electionTimer.Reset(rf.getElectionTimeout())
 			continue
 		}
 		if isHeartBeat { // 如果是心跳包 发空的log entries就可以了
-			go rf.sendHeartBeat(peer)
+			args := AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+			}
+			reply := AppendEntriesReply{}
+			go rf.sendAppendEntries(peer, &args, &reply)
 		}
 	}
 }
@@ -307,17 +346,22 @@ func (rf *Raft) sendHeartBeat(server int) { // 向server发送一个空的entry
 	}
 	reply := AppendEntriesReply{}
 
-	rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+	rf.sendAppendEntries(server, &args, &reply)
+	rf.mu.Unlock()
 }
 
 // 一个follower变成一个candidate发起选举流程
 // rf是candidate
 func (rf *Raft) StartElection() {
+	if rf.status == Leader {
+		rf.electionTimer.Reset(rf.getElectionTimeout())
+		return
+	}
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: len(rf.logs) - 1,
-		LastLogTerm:  rf.logs[len(rf.logs)-1].term,
+		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
 	}
 	DPrintf("{Server[%v] with term[%v]} starts a election with request %v.", rf.me, rf.currentTerm, args)
 	// 为自己投票
@@ -332,17 +376,17 @@ func (rf *Raft) StartElection() {
 		// 请求每一个server为自己投票
 		go func(server int) {
 			reply := RequestVoteReply{}
-			if rf.sendRequestVote(peer, &args, &reply) { // 如果收到了来自peer的投票
+			if rf.sendRequestVote(server, &args, &reply) { // 如果收到了来自peer的投票
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				DPrintf("{Server[%v] with term[%v]} receives vote from {Server[%v] with term[%v]}.", rf.me, rf.currentTerm, peer, reply.Term)
 				if rf.currentTerm == args.Term && rf.status == Candidate {
 					if reply.VoteGranted {
+						DPrintf("{Server[%v] with term[%v]} receives vote from {Server[%v] with term[%v]}.", rf.me, rf.currentTerm, server, reply.Term)
 						grantedVotes += 1
 						if grantedVotes > len(rf.peers)/2 {
-							DPrintf("{Server[%v] with term[%v]} receives marjority votes, and becomes a leader.", rf.me, rf.currentTerm)
+							DPrintf("{Server[%v] with term[%v] status[%v]} receives majority votes which is %v, and becomes a leader.", rf.me, rf.currentTerm, rf.status, grantedVotes)
 							rf.status = Leader
-							rf.BraodCastHeartBeat(true)
+							rf.BroadCastHeartBeat(true)
 						}
 					} else if reply.Term > rf.currentTerm {
 						DPrintf("{Server[%v] with term[%v]} has a term less than the term of server[%v] with term[%v], and it cannot be a leader.", rf.me, rf.currentTerm, peer, reply.Term)
@@ -366,8 +410,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("{Server[%v] with term[%v]}'s status is {status:%v, commitIndex:%v, lastApplied:%v} before processing AppendEntry.",
-		rf.me, rf.currentTerm, rf.status, rf.commitIndex, rf.lastApplied)
+	// defer DPrintf("{Server[%v] with term[%v]}'s status is {status:%v, commitIndex:%v, lastApplied:%v} before processing AppendEntry.",
+	// 	rf.me, rf.currentTerm, rf.status, rf.commitIndex, rf.lastApplied)
 
 	// args中是leader rf中是follower
 	if args.Term < rf.currentTerm {
@@ -381,6 +425,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.status = Follower                            // 既然收到了AppendEntries 那么一定是follower
 	rf.electionTimer.Reset(rf.getElectionTimeout()) // 重置选举定时器
+	DPrintf("{Server[%v] with term[%v]} receives entries from Server[%v].", rf.me, rf.currentTerm, args.LeaderId)
 
 	reply.Term, reply.Success = rf.currentTerm, true
 }
@@ -424,5 +469,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) getElectionTimeout() time.Duration {
 	ms := ElectionTimeout + time.Duration(rand.Int63())%ElectionTimeout
+	// DPrintf("Election timeout %v.", ms)
 	return ms
 }
