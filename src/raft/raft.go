@@ -85,6 +85,7 @@ type Raft struct {
 type LogEntry struct { // 如论文中所说 一个log entry是一个box 里面包含了这个entry的term和command
 	Term    int
 	Command interface{}
+	Index   int
 }
 
 type ServerType int
@@ -333,23 +334,6 @@ func (rf *Raft) BroadCastHeartBeat(isHeartBeat bool) {
 	}
 }
 
-func (rf *Raft) sendHeartBeat(server int) { // 向server发送一个空的entry
-	rf.mu.Lock()
-	if rf.status != Leader {
-		rf.mu.Unlock()
-		return
-	}
-
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-	reply := AppendEntriesReply{}
-
-	rf.sendAppendEntries(server, &args, &reply)
-	rf.mu.Unlock()
-}
-
 // 一个follower变成一个candidate发起选举流程
 // rf是candidate
 func (rf *Raft) StartElection() {
@@ -410,24 +394,72 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// defer DPrintf("{Server[%v] with term[%v]}'s status is {status:%v, commitIndex:%v, lastApplied:%v} before processing AppendEntry.",
-	// 	rf.me, rf.currentTerm, rf.status, rf.commitIndex, rf.lastApplied)
+	defer DPrintf("{Server[%v] with term[%v]}'s status is {status:%v, commitIndex:%v, lastApplied:%v} before processing AppendEntry.",
+		rf.me, rf.currentTerm, rf.status, rf.commitIndex, rf.lastApplied)
 
 	// args中是leader rf中是follower
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm { // 如果Leader的term < 当前server的term
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
 
-	if args.Term > rf.currentTerm {
-		rf.currentTerm, rf.votedFor = args.Term, -1
+	if args.Term > rf.currentTerm { // 如果leader的term > server
+		rf.currentTerm = args.Term
+		rf.status = Follower
+		rf.votedFor = -1
 	}
 
-	rf.status = Follower                            // 既然收到了AppendEntries 那么一定是follower
+	reply.Term = rf.currentTerm
 	rf.electionTimer.Reset(rf.getElectionTimeout()) // 重置选举定时器
-	DPrintf("{Server[%v] with term[%v]} receives entries from Server[%v].", rf.me, rf.currentTerm, args.LeaderId)
 
-	reply.Term, reply.Success = rf.currentTerm, true
+	// reply false if log doesn't contain an entry at preLogIndex whose term matches preLogTerm
+	// remember to handle the case where prevLogIndex points beyond the end of your log
+	if args.PrevLogIndex >= len(rf.logs) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	// delete conflicting entries and append new entries
+	// same index but different terms delete the existing entry and all that follow it
+	i := 0
+	j := args.PrevLogIndex + 1 // j等于leader的log的长度也等于new entries的第一个entry的下标
+	DPrintf("args.PrevLogIndex + 1 : %v", j)
+
+	hasConfilict := false
+	for i = 0; i < len(args.Entries); i++ { // 遍历即将附加进来的entries
+		if j >= len(rf.logs) {
+			break
+		}
+		if rf.logs[j].Term == args.Entries[i].Term { // 如果相等 继续往后比较
+			j++
+		} else { // 如果不相等 把后面的都drop掉
+			rf.logs = append(rf.logs[:j], args.Entries[i:]...)
+			i = len(args.Entries)
+			j = len(rf.logs) - 1
+			hasConfilict = true
+			break
+		}
+	}
+
+	if i < len(args.Entries) { // 如果后面还有剩的没复制上来
+		rf.logs = append(rf.logs, args.Entries[i:]...)
+		j = len(rf.logs) - 1 // 获取最后一个log entry的下标
+	} else if !hasConfilict {
+		j-- // 如果没有过冲突
+	}
+
+	reply.Success = true
+}
+
+func (rf *Raft) matchLog(prevLogTerm int, prevLogIndex int) bool {
+	if rf.logs[prevLogIndex].Term != prevLogTerm {
+		return false
+	}
+	return true
+}
+
+func (rf *Raft) getFirstLog() LogEntry {
+	return rf.logs[0]
 }
 
 // the service or tester wants to create a Raft server. the ports
