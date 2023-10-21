@@ -1,10 +1,9 @@
 package raft
 
-//
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
 // each of these functions for more details.
-//
+
 // rf = Make(...)
 //   create a new Raft server.
 // rf.Start(command interface{}) (index, term, isleader)
@@ -15,11 +14,11 @@ package raft
 //   each time a new entry is committed to the log, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
-//
 
 import (
 	//	"bytes"
 
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -55,6 +54,11 @@ const (
 	HeartBeatInterval = time.Millisecond * 50
 )
 
+const (
+	CHECKAPPENDPERIOD float64 = 10
+	CHECKCOMMITPERIOD float64 = 10
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -70,6 +74,8 @@ type Raft struct {
 
 	commitIndex int // 已知的最高提交的log entry的index
 	lastApplied int // 最高应用到state machine的index
+	cond        *sync.Cond
+	applyCh     chan ApplyMsg
 
 	nextIndex  []int // 下一个发送到该服务器的log entry的index
 	matchIndex []int // 已知在服务器上复制的最高的log entry的index
@@ -85,7 +91,6 @@ type Raft struct {
 type LogEntry struct { // 如论文中所说 一个log entry是一个box 里面包含了这个entry的term和command
 	Term    int
 	Command interface{}
-	Index   int
 }
 
 type ServerType int
@@ -260,7 +265,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // command will ever be committed to the Raft log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
-//
+
 // the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
@@ -268,11 +273,21 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// if the Raft instance is not the leader or has been killed, return gracefully
+	if rf.status != Leader || rf.killed() {
+		return index, term, false
+	}
+	DPrintf("Server[%v] (term[%v] status[%v]) starts a consensus.", rf.me, rf.currentTerm, rf.status)
+	// append the entry to the Raft's log
+	index = len(rf.logs)
+	term = rf.currentTerm
+	rf.logs = append(rf.logs, LogEntry{Term: rf.currentTerm, Command: command})
 
-	return index, term, isLeader
+	return index, term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -334,6 +349,91 @@ func (rf *Raft) BroadCastHeartBeat(isHeartBeat bool) {
 	}
 }
 
+func (rf *Raft) appendChecker(server int) {
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.status != Leader { // 如果挂了 或者不是leader 优雅地返回
+			rf.mu.Unlock()
+			return
+		}
+		term := rf.currentTerm
+		lastLogIndex := len(rf.logs) - 1
+		nextIndex := rf.nextIndex[server]
+		prevLogIndex := nextIndex - 1 // peer的最后一个log entry
+		prevLogTerm := rf.logs[prevLogIndex].Term
+		leaderCommit := rf.commitIndex
+		entries := rf.logs[nextIndex:] // 从nextIndex往后都是需要附加过来的 前提要保证nextIndex <= lastLogIndex
+		rf.mu.Unlock()
+		if lastLogIndex >= nextIndex { // 说明有需要附加到peer的entry
+			args := AppendEntriesArgs{
+				Term:         term,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: leaderCommit,
+			}
+			reply := AppendEntriesReply{}
+			DPrintf("Server[%v] (term[%v] status[%v]) try to send real entry to Server[%v], the entries[%v]", rf.me, rf.currentTerm, rf.status, server, args.Entries)
+			success := rf.sendAppendEntries(server, &args, &reply)
+
+			rf.mu.Lock()
+			if term != rf.currentTerm {
+				rf.mu.Unlock()
+				continue
+			}
+			if success {
+				rf.nextIndex[server] = nextIndex + len(entries)
+				rf.matchIndex[server] = prevLogIndex + len(entries)
+				DPrintf("Server[%v] (term[%v] status[%v]) send real entry to Server[%v] successfully, the entries[%v]", rf.me, rf.currentTerm, rf.status, server, args.Entries)
+			} else {
+				// 如果失败了说明leader原本就已经和peer不一致了 我们将nextIndex递减再重试
+				DPrintf("Server[%v] (term[%v] status[%v]) send real entry to Server[%v] failed, the entries[%v]", rf.me, rf.currentTerm, rf.status, server, args)
+				rf.nextIndex[server] = int(math.Min(1.0, float64(rf.nextIndex[server]-1)))
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
+		}
+		time.Sleep((time.Microsecond * time.Duration(CHECKAPPENDPERIOD)))
+	}
+}
+
+// 分配len(rf.peers)个go routine去检查是否需要附加entry
+func (rf *Raft) allocateAppendCheckers() {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		go rf.appendChecker(peer) // 每一个server检查自己是否需要附加entry
+	}
+}
+
+func (rf *Raft) commitChecker() {
+	for {
+		consensus := 1 // 已经提交到server的个数 自己算一个
+		rf.mu.Lock()
+		if rf.commitIndex < len(rf.logs)-1 {
+			nextCommitIndex := rf.commitIndex + 1 // 下一个要提交的entry的index
+			for peer := range rf.peers {
+				if peer == rf.me {
+					continue
+				}
+				if rf.matchIndex[peer] >= nextCommitIndex {
+					consensus++
+				}
+			}
+			if consensus > len(rf.peers)/2 && rf.logs[nextCommitIndex].Term == rf.currentTerm {
+				DPrintf("Server[%v] (term[%v] status[%v]) commit log entry[%+v] successfully.", rf.me, rf.currentTerm, rf.status, rf.logs[nextCommitIndex])
+				rf.commitIndex = nextCommitIndex
+				rf.cond.Broadcast()
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Microsecond * time.Duration(CHECKCOMMITPERIOD))
+	}
+}
+
 // 一个follower变成一个candidate发起选举流程
 // rf是candidate
 func (rf *Raft) StartElection() {
@@ -347,7 +447,7 @@ func (rf *Raft) StartElection() {
 		LastLogIndex: len(rf.logs) - 1,
 		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
 	}
-	DPrintf("{Server[%v] with term[%v]} starts a election with request %v.", rf.me, rf.currentTerm, args)
+	DPrintf("Server[%v] (term[%v] status[%v]) starts a election.", rf.me, rf.currentTerm, rf.status)
 	// 为自己投票
 	grantedVotes := 1
 	rf.votedFor = rf.me
@@ -365,15 +465,21 @@ func (rf *Raft) StartElection() {
 				defer rf.mu.Unlock()
 				if rf.currentTerm == args.Term && rf.status == Candidate {
 					if reply.VoteGranted {
-						DPrintf("{Server[%v] with term[%v]} receives vote from {Server[%v] with term[%v]}.", rf.me, rf.currentTerm, server, reply.Term)
+						DPrintf("Server[%v] (term[%v] status[%v]) receives vote from Server[%v] (term[%v]).", rf.me, rf.currentTerm, rf.status, server, reply.Term)
 						grantedVotes += 1
 						if grantedVotes > len(rf.peers)/2 {
-							DPrintf("{Server[%v] with term[%v] status[%v]} receives majority votes which is %v, and becomes a leader.", rf.me, rf.currentTerm, rf.status, grantedVotes)
+							DPrintf("Server[%v] (term[%v] status[%v]) receives majority votes which is %v, and becomes a leader.", rf.me, rf.currentTerm, rf.status, grantedVotes)
 							rf.status = Leader
+							// 在选举成功后 设置nextIndex和matchIndex
+							for i := 0; i < len(rf.peers); i++ {
+								rf.nextIndex[i] = len(rf.logs) // rf.logs indexed from 1
+								rf.matchIndex[i] = 0
+							}
 							rf.BroadCastHeartBeat(true)
+							go rf.allocateAppendCheckers()
+							go rf.commitChecker()
 						}
 					} else if reply.Term > rf.currentTerm {
-						DPrintf("{Server[%v] with term[%v]} has a term less than the term of server[%v] with term[%v], and it cannot be a leader.", rf.me, rf.currentTerm, peer, reply.Term)
 						rf.currentTerm = reply.Term
 						rf.status = Follower
 						rf.votedFor = -1
@@ -394,8 +500,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("{Server[%v] with term[%v]}'s status is {status:%v, commitIndex:%v, lastApplied:%v} before processing AppendEntry.",
-		rf.me, rf.currentTerm, rf.status, rf.commitIndex, rf.lastApplied)
 
 	// args中是leader rf中是follower
 	if args.Term < rf.currentTerm { // 如果Leader的term < 当前server的term
@@ -422,8 +526,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// delete conflicting entries and append new entries
 	// same index but different terms delete the existing entry and all that follow it
 	i := 0
-	j := args.PrevLogIndex + 1 // j等于leader的log的长度也等于new entries的第一个entry的下标
-	DPrintf("args.PrevLogIndex + 1 : %v", j)
+	j := args.PrevLogIndex + 1 // j等于leader的log中已提交的长度也等于new entries的第一个entry的下标
 
 	hasConfilict := false
 	for i = 0; i < len(args.Entries); i++ { // 遍历即将附加进来的entries
@@ -449,17 +552,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-}
 
-func (rf *Raft) matchLog(prevLogTerm int, prevLogIndex int) bool {
-	if rf.logs[prevLogIndex].Term != prevLogTerm {
-		return false
+	if args.LeaderCommit > rf.commitIndex {
+		oldCommitIndex := rf.commitIndex
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(j)))
+		DPrintf("Server[%v] (term[%v] status[%v])'s commitIndex is %v.", rf.me, rf.currentTerm, rf.status, rf.commitIndex)
+		if rf.commitIndex > oldCommitIndex { // 说明有更新 通知leader
+			rf.cond.Broadcast() // 唤醒所有被条件变量阻塞的协程
+		}
 	}
-	return true
 }
 
-func (rf *Raft) getFirstLog() LogEntry {
-	return rf.logs[0]
+func (rf *Raft) applyCommited() {
+	for {
+		if rf.status == Leader {
+			rf.mu.Lock()
+			for rf.lastApplied >= rf.commitIndex { // 如果应用到状态机上的entry的下标不小于服务器上最高被提交的entry的话，
+				// 说明所有已经提交的都已经应用到状态机上面了 那么就将条件变量阻塞住，等待新的被提交的entry
+				rf.cond.Wait()
+			}
+			rf.lastApplied++ // 得到下一个应该应用的下标
+			DPrintf("Server[%v] (term[%v] status[%v]) try to apply log entry[%+v] to the state machine.", rf.me, rf.currentTerm, rf.status, rf.logs[rf.lastApplied])
+			cmtidx := rf.lastApplied
+			command := rf.logs[cmtidx].Command // 得到下一个应该应用的指令
+			rf.mu.Unlock()
+			// 接下来应用这个指令
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      command,
+				CommandIndex: cmtidx,
+			}
+			// 应用指令，这里有可能被管道阻塞
+			rf.applyCh <- msg
+			DPrintf("Server[%v] (term[%v] status[%v]) apply log entry[%+v] to the state machine successfully.", rf.me, rf.currentTerm, rf.status, rf.logs[rf.lastApplied])
+		}
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -487,6 +614,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.cond = sync.NewCond(&rf.mu) // 条件变量和锁关联
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -496,6 +625,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go rf.ticker()
 
+	// start a background go routine that periodically apply the committed log entry
+	go rf.applyCommited()
 	return rf
 }
 
