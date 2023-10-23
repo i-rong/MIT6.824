@@ -253,9 +253,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
+// 这里要注意sendRequestVote返回的是指调用api是否成功 峰会失败说明发送失败或者接收失败 它的成功与否和是否投票没有关系
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+// 返回值表示是否收到投票
+func (rf *Raft) callRequestVote(server int, term int, lastLogIndex int, lastLogTerm int) bool {
+	DPrintf("Candidate[%v] (term[%v] status[%v]) ask Server[%v] to vote for it.", rf.me, rf.currentTerm, rf.status, server)
+	args := RequestVoteArgs{
+		Term:         term,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+	reply := RequestVoteReply{}
+	ok := rf.sendRequestVote(server, &args, &reply)
+	if !ok {
+		return false
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 比较请求投票和响应投票时的term 如果不相同 直接将这个reply丢弃
+	if term != rf.currentTerm {
+		return false
+	}
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.status = Follower
+		rf.votedFor = -1
+	}
+	return reply.VoteGranted
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -324,32 +355,30 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
 			if rf.status == Leader { // 只有是leader才发送心跳包
-				rf.BroadCastHeartBeat(true)
+				rf.BroadCastHeartBeat()
 			}
 			rf.mu.Unlock()
 		}
 	}
 }
 
-func (rf *Raft) BroadCastHeartBeat(isHeartBeat bool) {
+func (rf *Raft) BroadCastHeartBeat() {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			rf.heartbeatTimer.Reset(HeartBeatInterval)
 			rf.electionTimer.Reset(rf.getElectionTimeout())
 			continue
 		}
-		if isHeartBeat { // 如果是心跳包 发空的log entries就可以了
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: len(rf.logs) - 1,
-				PrevLogTerm:  rf.logs[len(rf.logs)-1].Term,
-				Entries:      make([]LogEntry, 0),
-				LeaderCommit: rf.commitIndex,
-			}
-			reply := AppendEntriesReply{}
-			go rf.sendAppendEntries(peer, &args, &reply)
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: len(rf.logs) - 1,
+			PrevLogTerm:  rf.logs[len(rf.logs)-1].Term,
+			Entries:      make([]LogEntry, 0),
+			LeaderCommit: rf.commitIndex,
 		}
+		reply := AppendEntriesReply{}
+		go rf.sendAppendEntries(peer, &args, &reply)
 	}
 }
 
@@ -466,55 +495,45 @@ func (rf *Raft) commitChecker() {
 // 一个follower变成一个candidate发起选举流程
 // rf是candidate
 func (rf *Raft) StartElection() {
-	if rf.status == Leader {
-		rf.electionTimer.Reset(rf.getElectionTimeout())
-		return
-	}
-	args := RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: len(rf.logs) - 1,
-		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
-	}
 	DPrintf("Server[%v] (term[%v] status[%v]) starts a election.", rf.me, rf.currentTerm, rf.status)
 	// 为自己投票
-	grantedVotes := 1
 	rf.votedFor = rf.me
 	rf.electionTimer.Reset(rf.getElectionTimeout())
+	term := rf.currentTerm
+	lastLogIndex := len(rf.logs) - 1
+	lastLogTerm := rf.logs[lastLogIndex].Term
+	DPrintf("510!!!")
 	// rf.persist()
+	grantedVotes := 1
+	electionFinished := false // 确保只进行一次选举
+	var voteMutex sync.Mutex
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 		// 请求每一个server为自己投票
 		go func(server int) {
-			reply := RequestVoteReply{}
-			if rf.sendRequestVote(server, &args, &reply) { // 如果收到了来自peer的投票
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if rf.currentTerm == args.Term && rf.status == Candidate {
-					if reply.VoteGranted {
-						DPrintf("Server[%v] (term[%v] status[%v]) receives vote from Server[%v] (term[%v]).", rf.me, rf.currentTerm, rf.status, server, reply.Term)
-						grantedVotes += 1
-						if grantedVotes > len(rf.peers)/2 {
-							DPrintf("Server[%v] (term[%v] status[%v]) receives majority votes which is %v, and becomes a leader.", rf.me, rf.currentTerm, rf.status, grantedVotes)
-							rf.status = Leader
-							// 在选举成功后 设置nextIndex和matchIndex
-							for i := 0; i < len(rf.peers); i++ {
-								rf.nextIndex[i] = len(rf.logs) // rf.logs indexed from 1
-								rf.matchIndex[i] = 0
-							}
-							rf.BroadCastHeartBeat(true)
-							go rf.allocateAppendCheckers()
-							go rf.commitChecker()
-						}
-					} else if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.status = Follower
-						rf.votedFor = -1
+			voteGranted := rf.callRequestVote(server, term, lastLogIndex, lastLogTerm)
+			DPrintf("523:")
+			voteMutex.Lock()
+			if voteGranted && !electionFinished {
+				grantedVotes++
+				if grantedVotes > len(rf.peers)/2 {
+					DPrintf("Server[%v] (term[%v] status[%v]) receives majority of votes and becomes leader.", rf.me, rf.currentTerm, rf.status)
+					electionFinished = true // 选举成功
+					rf.mu.Lock()
+					rf.status = Leader
+					for i := 0; i < len(rf.peers); i++ {
+						rf.nextIndex[i] = len(rf.logs)
+						rf.matchIndex[i] = 0
 					}
+					rf.mu.Unlock()
+					go rf.BroadCastHeartBeat()
+					go rf.allocateAppendCheckers()
+					go rf.commitChecker()
 				}
 			}
+			voteMutex.Unlock()
 		}(peer)
 	}
 }
