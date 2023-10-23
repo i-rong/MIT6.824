@@ -27,6 +27,7 @@ import (
 	"time"
 )
 
+// 生成一个随机字符串 里面有n个字符
 func randstring(n int) string {
 	b := make([]byte, 2*n)
 	crand.Read(b)
@@ -52,7 +53,7 @@ type config struct {
 	connected   []bool   // whether each server is on the net
 	saved       []*Persister
 	endnames    [][]string            // the port file names each sends to
-	logs        []map[int]interface{} // copy of each server's committed entries
+	logs        []map[int]interface{} // 每一个server上已提交的entry logs[i]表示第i个server上的所有entry 一个entry由一个term和一个command组成
 	lastApplied []int
 	start       time.Time // time at which make_config() was called
 	// begin()/end() statistics
@@ -144,7 +145,7 @@ func (cfg *config) crash1(i int) {
 func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	err_msg := ""
 	v := m.Command
-	for j := 0; j < len(cfg.logs); j++ {
+	for j := 0; j < len(cfg.logs); j++ { // 遍历所有的server
 		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!

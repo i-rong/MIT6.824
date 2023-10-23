@@ -17,6 +17,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math"
 	"math/rand"
 	"sync"
@@ -26,6 +27,8 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
+
+var bt int64 = 0
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -312,7 +315,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.status != Leader || rf.killed() {
 		return index, term, false
 	}
-	DPrintf("Server[%v] (term[%v] status[%v]) receives a command[%v] and set it into log.", rf.me, rf.currentTerm, rf.status, command)
+	DPrintf("Server[%v] (term[%v] status[%v]) receives a command[] and set it into log.", rf.me, rf.currentTerm, rf.status)
 	// append the entry to the Raft's log
 	index = len(rf.logs)
 	term = rf.currentTerm
@@ -346,18 +349,11 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		select {
 		case <-rf.electionTimer.C:
-			rf.mu.Lock()
-			rf.status = Candidate // 改变状态为candidate
-			rf.currentTerm += 1
 			rf.StartElection()
-			rf.electionTimer.Reset(rf.getElectionTimeout())
-			rf.mu.Unlock()
 		case <-rf.heartbeatTimer.C:
-			rf.mu.Lock()
 			if rf.status == Leader { // 只有是leader才发送心跳包
-				rf.BroadCastHeartBeat()
+				go rf.BroadCastHeartBeat()
 			}
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -383,7 +379,7 @@ func (rf *Raft) BroadCastHeartBeat() {
 }
 
 func (rf *Raft) callAppendEntries(server int, term int, prevLogIndex int, prevLogTerm int, entries []LogEntry, leaderCommit int) (bool, []LogEntry) {
-	DPrintf("Server[%v] (term[%v] status[%v]) send entries[%+v] to Server[%v].", rf.me, rf.currentTerm, rf.status, entries, server)
+	DPrintf("Server[%v] (term[%v] status[%v]) send entries[] to Server[%v].", rf.me, rf.currentTerm, rf.status, server)
 	args := AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
@@ -434,7 +430,7 @@ func (rf *Raft) appendChecker(server int) {
 		entries := rf.logs[nextIndex:] // 从nextIndex往后都是需要附加过来的 前提要保证nextIndex <= lastLogIndex
 		rf.mu.Unlock()
 		if lastLogIndex >= nextIndex { // 说明有需要附加到peer的entry
-			success, serverEntries := rf.callAppendEntries(server, term, prevLogIndex, prevLogTerm, entries, leaderCommit)
+			success, _ := rf.callAppendEntries(server, term, prevLogIndex, prevLogTerm, entries, leaderCommit)
 			rf.mu.Lock()
 			if term != rf.currentTerm {
 				rf.mu.Unlock()
@@ -443,8 +439,8 @@ func (rf *Raft) appendChecker(server int) {
 			if success {
 				rf.nextIndex[server] = nextIndex + len(entries)
 				rf.matchIndex[server] = prevLogIndex + len(entries)
-				DPrintf("Server[%v] (term[%v] status[%v]) send real appendEntries[%v] to Server[%v] successfully.", rf.me, rf.currentTerm, rf.status, entries, server)
-				DPrintf("Leader[%v] entries[%v]   VS   Server[%v] entries[%v].", rf.me, rf.logs, server, serverEntries)
+				DPrintf("Server[%v] (term[%v] status[%v]) send real appendEntries[] to Server[%v] successfully.", rf.me, rf.currentTerm, rf.status, server)
+				DPrintf("Leader[%v] entries[]   VS   Server[%v] entries[].", rf.me, server)
 			} else {
 				rf.nextIndex[server] = rf.nextIndex[server] - 1
 				rf.mu.Unlock()
@@ -482,7 +478,7 @@ func (rf *Raft) commitChecker() {
 				}
 			}
 			if consensus > len(rf.peers)/2 && rf.logs[nextCommitIndex].Term == rf.currentTerm {
-				DPrintf("Server[%v] (term[%v] status[%v]) commit log entry[%+v] successfully.", rf.me, rf.currentTerm, rf.status, rf.logs[nextCommitIndex])
+				DPrintf("Server[%v] (term[%v] status[%v]) commit log entry[] successfully.", rf.me, rf.currentTerm, rf.status)
 				rf.commitIndex = nextCommitIndex
 				rf.cond.Broadcast()
 			}
@@ -495,14 +491,17 @@ func (rf *Raft) commitChecker() {
 // 一个follower变成一个candidate发起选举流程
 // rf是candidate
 func (rf *Raft) StartElection() {
-	DPrintf("Server[%v] (term[%v] status[%v]) starts a election.", rf.me, rf.currentTerm, rf.status)
+	DPrintf("Server[%v] (term[%v] status[%v]) starts a election, and becomes a Candidate.", rf.me, rf.currentTerm, rf.status)
 	// 为自己投票
+	rf.mu.Lock()
+	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.status = Candidate
 	rf.electionTimer.Reset(rf.getElectionTimeout())
 	term := rf.currentTerm
 	lastLogIndex := len(rf.logs) - 1
 	lastLogTerm := rf.logs[lastLogIndex].Term
-	DPrintf("510!!!")
+	rf.mu.Unlock()
 	// rf.persist()
 	grantedVotes := 1
 	electionFinished := false // 确保只进行一次选举
@@ -514,7 +513,6 @@ func (rf *Raft) StartElection() {
 		// 请求每一个server为自己投票
 		go func(server int) {
 			voteGranted := rf.callRequestVote(server, term, lastLogIndex, lastLogTerm)
-			DPrintf("523:")
 			voteMutex.Lock()
 			if voteGranted && !electionFinished {
 				grantedVotes++
@@ -528,7 +526,7 @@ func (rf *Raft) StartElection() {
 						rf.matchIndex[i] = 0
 					}
 					rf.mu.Unlock()
-					go rf.BroadCastHeartBeat()
+					rf.BroadCastHeartBeat()
 					go rf.allocateAppendCheckers()
 					go rf.commitChecker()
 				}
@@ -612,7 +610,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.cond.Broadcast() // 唤醒所有被条件变量阻塞的协程
 		}
 	}
-	DPrintf("args.entries[%v]    rf.log[%v].", args.Entries, rf.logs)
 }
 
 func (rf *Raft) applyCommited() {
@@ -624,7 +621,7 @@ func (rf *Raft) applyCommited() {
 			rf.cond.Wait()
 		}
 		rf.lastApplied++ // 得到下一个应该应用的下标
-		DPrintf("Server[%v] (term[%v] status[%v]) try to apply log entry[%+v] to the state machine.", rf.me, rf.currentTerm, rf.status, rf.logs[rf.lastApplied])
+		DPrintf("Server[%v] (term[%v] status[%v]) try to apply log entry[] to the state machine.", rf.me, rf.currentTerm, rf.status)
 		cmtidx := rf.lastApplied
 		command := rf.logs[cmtidx].Command // 得到下一个应该应用的指令
 		rf.mu.Unlock()
@@ -636,7 +633,7 @@ func (rf *Raft) applyCommited() {
 		}
 		// 应用指令，这里有可能被管道阻塞
 		rf.applyCh <- msg
-		DPrintf("Server[%v] (term[%v] status[%v]) apply log entry[%+v] to the state machine successfully. Now the logs are[%+v].", rf.me, rf.currentTerm, rf.status, rf.logs[rf.lastApplied], rf.logs)
+		DPrintf("Server[%v] (term[%v] status[%v]) apply log entry[] to the state machine successfully. Now the logs are[].", rf.me, rf.currentTerm, rf.status)
 	}
 }
 
@@ -651,7 +648,6 @@ func (rf *Raft) applyCommited() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -684,6 +680,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) getElectionTimeout() time.Duration {
 	ms := ElectionTimeout + time.Duration(rand.Int63())%ElectionTimeout
-	// DPrintf("Election timeout %v.", ms)
 	return ms
 }
