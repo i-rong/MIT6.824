@@ -193,26 +193,38 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("[term %d]: Raft[%d] receive requestVote from Raft[%d]", rf.currentTerm, rf.me, args.CandidateId)
 
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-	if rf.currentTerm > args.Term {
+	// reply false immediately if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
 
-	if rf.currentTerm == args.Term && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		return
-	}
-
+	// other server has higher term !
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.votedFor = -1
 		rf.status = Follower
+		rf.votedFor = -1
 	}
 
-	rf.votedFor = args.CandidateId
-	rf.electionTimer.Reset(rf.getElectionTimeout())
-	reply.Term, reply.VoteGranted = rf.currentTerm, true
+	reply.Term = rf.currentTerm
+	// this server has not voted for other server in this term
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		lastlogterm := rf.logs[len(rf.logs)-1].Term
+		// the candidate's is at least as up-to-date as receiver's log, grant vote !!
+		if args.LastLogTerm > lastlogterm ||
+			(args.LastLogTerm == lastlogterm && args.LastLogIndex >= len(rf.logs)-1) {
+			// reset timer only when you **grant** the vote for another server
+			rf.electionTimer.Reset(rf.getElectionTimeout())
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+			DPrintf("[term %d]: Raft [%d] vote for Raft [%d]", rf.currentTerm, rf.me, rf.votedFor)
+			return
+		}
+	}
+	reply.VoteGranted = false
 }
 
 // func (rf *Raft) isLogUpToDate(lastLogIndex int, lastLogTerm int) bool {
