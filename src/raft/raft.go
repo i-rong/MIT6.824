@@ -52,11 +52,11 @@ type ApplyMsg struct {
 }
 
 const (
-	ElectionTimeout   = time.Millisecond * 500
-	HeartBeatInterval = time.Millisecond * 150
+	ElectionTimeout = time.Millisecond * 500
 )
 
 const (
+	HeartBeatInterval float64 = 100
 	CHECKAPPENDPERIOD float64 = 10
 	CHECKCOMMITPERIOD float64 = 10
 )
@@ -86,8 +86,7 @@ type Raft struct {
 	// 超过election定时器 这个follower服务器就变成一个candidate
 	// 每隔heartbeat时间 leader就要给所有的follower发一个空的appendentry 以此来告诉其他的follower leader还活着 不要开始新的选举
 	// 讲道理 heartbeat应该比election时间要短
-	electionTimer  *time.Timer
-	heartbeatTimer *time.Timer
+	electionTimer *time.Timer
 }
 
 type LogEntry struct { // 如论文中所说 一个log entry是一个box 里面包含了这个entry的term和command
@@ -186,7 +185,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前server的term 便于让leader去更新自己
 	Success bool // 如果那个被replicate entries的follower匹配上了prevLogIndex和prevLogTerm就返回true
-	Entries []LogEntry
 }
 
 // example RequestVote RPC handler.
@@ -344,42 +342,42 @@ func (rf *Raft) killed() bool {
 }
 
 // 如果是electionTimer时间到 那么就开启新一轮选举
-// 如果是heartbeat时间到 并且是leader 那么就发起新的一轮心跳
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		select {
-		case <-rf.electionTimer.C:
+		<-rf.electionTimer.C
+		if rf.status != Leader {
 			rf.StartElection()
-		case <-rf.heartbeatTimer.C:
-			if rf.status == Leader { // 只有是leader才发送心跳包
-				go rf.BroadCastHeartBeat()
+		}
+	}
+}
+
+func (rf *Raft) leaderHeartBeat() {
+	DPrintf("Server[%v] (term[%v] status[%v]) send heartbeat to other server!", rf.me, rf.currentTerm, rf.status)
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.status != Leader {
+			rf.mu.Unlock()
+			return
+		}
+		term := rf.currentTerm
+		leaderCommit := rf.commitIndex
+		prevLogIndex := len(rf.logs) - 1
+		prevLogTerm := rf.logs[prevLogIndex].Term
+		rf.mu.Unlock()
+		for peer := range rf.peers {
+			if peer == rf.me {
+				continue
 			}
+			go func(server int) {
+				rf.callAppendEntries(server, term, prevLogIndex, prevLogTerm, make([]LogEntry, 0), leaderCommit)
+			}(peer)
 		}
+		time.Sleep(time.Millisecond * time.Duration(HeartBeatInterval))
 	}
 }
 
-func (rf *Raft) BroadCastHeartBeat() {
-	for peer := range rf.peers {
-		if peer == rf.me {
-			rf.heartbeatTimer.Reset(HeartBeatInterval)
-			rf.electionTimer.Reset(rf.getElectionTimeout())
-			continue
-		}
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: len(rf.logs) - 1,
-			PrevLogTerm:  rf.logs[len(rf.logs)-1].Term,
-			Entries:      make([]LogEntry, 0),
-			LeaderCommit: rf.commitIndex,
-		}
-		reply := AppendEntriesReply{}
-		go rf.sendAppendEntries(peer, &args, &reply)
-	}
-}
-
-func (rf *Raft) callAppendEntries(server int, term int, prevLogIndex int, prevLogTerm int, entries []LogEntry, leaderCommit int) (bool, []LogEntry) {
-	DPrintf("Server[%v] (term[%v] status[%v]) send entries[] to Server[%v].", rf.me, rf.currentTerm, rf.status, server)
+func (rf *Raft) callAppendEntries(server int, term int, prevLogIndex int, prevLogTerm int, entries []LogEntry, leaderCommit int) bool {
+	DPrintf("Server[%v] (term[%v] status[%v]) send entries[%v] to Server[%v].", rf.me, rf.currentTerm, rf.status, entries, server)
 	args := AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
@@ -392,16 +390,14 @@ func (rf *Raft) callAppendEntries(server int, term int, prevLogIndex int, prevLo
 	ok := rf.sendAppendEntries(server, &args, &reply)
 
 	if !ok {
-		temp := make([]LogEntry, 0)
-		return false, temp
+		return false
 	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if term != rf.currentTerm {
-		temp := make([]LogEntry, 0)
-		return false, temp
+		return false
 	}
 
 	if reply.Term > rf.currentTerm {
@@ -410,7 +406,7 @@ func (rf *Raft) callAppendEntries(server int, term int, prevLogIndex int, prevLo
 		rf.status = Follower
 		rf.votedFor = -1
 	}
-	return reply.Success, reply.Entries
+	return reply.Success
 }
 
 // 检查当前server是否有新放进来还没有发送给follower的log entry
@@ -430,7 +426,7 @@ func (rf *Raft) appendChecker(server int) {
 		entries := rf.logs[nextIndex:] // 从nextIndex往后都是需要附加过来的 前提要保证nextIndex <= lastLogIndex
 		rf.mu.Unlock()
 		if lastLogIndex >= nextIndex { // 说明有需要附加到peer的entry
-			success, _ := rf.callAppendEntries(server, term, prevLogIndex, prevLogTerm, entries, leaderCommit)
+			success := rf.callAppendEntries(server, term, prevLogIndex, prevLogTerm, entries, leaderCommit)
 			rf.mu.Lock()
 			if term != rf.currentTerm {
 				rf.mu.Unlock()
@@ -439,10 +435,9 @@ func (rf *Raft) appendChecker(server int) {
 			if success {
 				rf.nextIndex[server] = nextIndex + len(entries)
 				rf.matchIndex[server] = prevLogIndex + len(entries)
-				DPrintf("Server[%v] (term[%v] status[%v]) send real appendEntries[] to Server[%v] successfully.", rf.me, rf.currentTerm, rf.status, server)
-				DPrintf("Leader[%v] entries[]   VS   Server[%v] entries[].", rf.me, server)
+				DPrintf("Server[%v] (term[%v] status[%v]) send real appendEntries[%v] to Server[%v] successfully.", rf.me, rf.currentTerm, rf.status, entries, server)
 			} else {
-				rf.nextIndex[server] = rf.nextIndex[server] - 1
+				rf.nextIndex[server] = int(math.Max(1.0, float64(rf.nextIndex[server])-1))
 				rf.mu.Unlock()
 				continue
 			}
@@ -526,7 +521,7 @@ func (rf *Raft) StartElection() {
 						rf.matchIndex[i] = 0
 					}
 					rf.mu.Unlock()
-					rf.BroadCastHeartBeat()
+					go rf.leaderHeartBeat()
 					go rf.allocateAppendCheckers()
 					go rf.commitChecker()
 				}
@@ -575,7 +570,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	i := 0
 	j := args.PrevLogIndex + 1 // j等于leader的log中已提交的长度也等于new entries的第一个entry的下标
 
-	hasConfilict := false
+	// hasConfilict := false
 	for i = 0; i < len(args.Entries); i++ { // 遍历即将附加进来的entries
 		if j >= len(rf.logs) {
 			break
@@ -587,7 +582,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DPrintf("Server[%v] not equel!!! update to rf.logs[%v].", rf.me, rf.logs)
 			i = len(args.Entries)
 			j = len(rf.logs) - 1
-			hasConfilict = true
 			break
 		}
 	}
@@ -595,12 +589,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if i < len(args.Entries) { // 如果后面还有剩的没复制上来
 		rf.logs = append(rf.logs, args.Entries[i:]...)
 		j = len(rf.logs) - 1 // 获取最后一个log entry的下标
-	} else if !hasConfilict {
+	} else {
 		j-- // 如果没有过冲突
 	}
 
 	reply.Success = true
-	reply.Entries = rf.logs
 
 	if args.LeaderCommit > rf.commitIndex {
 		oldCommitIndex := rf.commitIndex
@@ -669,7 +662,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
 	rf.electionTimer = time.NewTimer(rf.getElectionTimeout())
-	rf.heartbeatTimer = time.NewTimer(HeartBeatInterval)
 
 	go rf.ticker()
 
