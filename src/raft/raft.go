@@ -49,8 +49,8 @@ type ApplyMsg struct {
 }
 
 const (
-	ElectionTimeout  = time.Millisecond * 500
-	HeartBeatTimeout = time.Millisecond * 120
+	ElectionTimeout  = 200
+	HeartBeatTimeout = time.Millisecond * 100
 )
 
 type ServerType int
@@ -249,7 +249,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	case Expire:
 		{
 			rf.status = Follower
-			rf.electionTimer.Reset(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+			rf.electionTimer.Reset(getRandms(ElectionTimeout))
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
@@ -260,6 +260,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			*voteNum++
 		}
 		if *voteNum > len(rf.peers)/2 {
+			DPrintf("Server%v(term%v status%v) receives majority of votes and becomes a leader.", rf.me, rf.currentTerm, rf.status)
 			*voteNum = 0
 			if rf.status == Leader {
 				return ok
@@ -298,6 +299,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.electionTimer.Reset(getRandms(ElectionTimeout))
+
 	if args.Term > rf.currentTerm {
 		rf.status = Follower
 		rf.currentTerm = args.Term
@@ -327,7 +330,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		} else {
 			rf.status = Follower
 		}
-		rf.electionTimer.Reset(time.Duration(150+rand.Intn(200)) * time.Millisecond)
 	}
 }
 
@@ -394,7 +396,7 @@ func (rf *Raft) ticker() {
 		case Candidate:
 			rf.currentTerm++
 			rf.votedFor = rf.me
-			rf.electionTimer.Reset(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+			rf.electionTimer.Reset(getRandms(ElectionTimeout))
 			rf.startElection()
 		case Leader:
 			appendNums := 1
@@ -442,6 +444,7 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, appendNum *int) {
+	DPrintf("Leader%v(term%v status%v) heartbeat to server%v.", rf.me, rf.currentTerm, rf.status, server)
 	if rf.killed() {
 		return
 	}
@@ -496,7 +499,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.currentTerm = reply.Term
 		rf.status = Follower
 		rf.votedFor = -1
-		rf.electionTimer.Reset(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+		rf.electionTimer.Reset(getRandms(ElectionTimeout))
 	case AppendCommitted:
 		if args.Term != rf.currentTerm {
 			return
@@ -544,7 +547,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	rf.votedFor = args.LeaderId
 	rf.status = Follower
-	rf.electionTimer.Reset(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+	rf.electionTimer.Reset(getRandms(ElectionTimeout))
 
 	reply.AppendEntriesState = AppendNormal
 	reply.Term = rf.currentTerm
@@ -597,8 +600,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
-	rf.electionTimer = time.NewTicker(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+	rf.electionTimer = time.NewTicker(getRandms(ElectionTimeout))
 	go rf.ticker()
 
 	return rf
+}
+
+func getRandms(electionTimeout int) time.Duration {
+	return time.Duration(electionTimeout+rand.Intn(electionTimeout)) * time.Millisecond
 }
