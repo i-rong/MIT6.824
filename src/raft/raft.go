@@ -356,7 +356,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.status != Leader || rf.killed() {
 		return index, term, false
 	}
-	DPrintf("Server[%v] (term[%v] status[%v]) receives a command[] and set it into log.", rf.me, rf.currentTerm, rf.status)
+	DPrintf("Server%v(term%v status%v) receives a command%v and set it into log.", rf.me, rf.currentTerm, rf.status, command)
 	// append the entry to the Raft's log
 	index = len(rf.logs)
 	term = rf.currentTerm
@@ -408,13 +408,15 @@ func (rf *Raft) ticker() {
 				args := AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
-					PrevLogIndex: len(rf.logs) - 1,
-					PrevLogTerm:  rf.logs[len(rf.logs)-1].Term,
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  rf.logs[rf.nextIndex[i]-1].Term,
 					Entries:      nil,
 					LeaderCommit: rf.commitIndex,
 				}
 				reply := AppendEntriesReply{}
-				args.Entries = rf.logs[rf.nextIndex[i]:]
+				if rf.nextIndex[i] < len(rf.logs) {
+					args.Entries = rf.logs[rf.nextIndex[i]:]
+				}
 				go rf.sendAppendEntries(i, &args, &reply, &appendNums)
 			}
 		}
@@ -444,9 +446,11 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, appendNum *int) {
-	DPrintf("Leader%v(term%v status%v) heartbeat to server%v.", rf.me, rf.currentTerm, rf.status, server)
 	if rf.killed() {
 		return
+	}
+	if args.Entries != nil {
+		DPrintf("Leader%v(term%v status%v) send real entries%v to Server%v.", rf.me, rf.currentTerm, rf.status, args.Entries, server)
 	}
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -462,9 +466,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	switch reply.AppendEntriesState {
 	case AppendKilled:
+		DPrintf("Server%v killed.", server)
 		return
 	case AppendNormal:
 		{
+			DPrintf("Leader%v(term%v status%v) send real entries to Server%v successfully.", rf.me, rf.currentTerm, rf.status, server)
 			if reply.Success && reply.Term == rf.currentTerm && *appendNum <= len(rf.peers)/2 {
 				*appendNum++
 			}
@@ -477,30 +483,33 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				if rf.logs[len(rf.logs)-1].Term != rf.currentTerm {
 					return
 				}
-			}
-			for rf.lastApplied < len(rf.logs)-1 {
-				rf.lastApplied++
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					CommandIndex: rf.lastApplied,
-					Command:      rf.logs[rf.lastApplied].Command,
+				for rf.lastApplied < len(rf.logs)-1 {
+					rf.lastApplied++
+					applyMsg := ApplyMsg{
+						CommandValid: true,
+						CommandIndex: rf.lastApplied,
+						Command:      rf.logs[rf.lastApplied].Command,
+					}
+					DPrintf("Leader%v(term%v status%v) commit entry%v to state machine.", rf.me, rf.currentTerm, rf.status, applyMsg.Command)
+					rf.applyCh <- applyMsg
+					rf.commitIndex = rf.lastApplied
 				}
-				rf.applyCh <- applyMsg
-				rf.commitIndex = rf.lastApplied
 			}
 			return
 		}
 	case MissMatch:
+		DPrintf("Server%v missmatch.", server)
 		if args.Term != rf.currentTerm {
 			return
 		}
 		rf.nextIndex[server] = reply.UpNextIndex
 	case AppendOutofDate:
+		DPrintf("Server%v AppendOutofDate.", server)
 		rf.currentTerm = reply.Term
 		rf.status = Follower
 		rf.votedFor = -1
-		rf.electionTimer.Reset(getRandms(ElectionTimeout))
 	case AppendCommitted:
+		DPrintf("Server%v AppendCommitted.", AppendCommitted)
 		if args.Term != rf.currentTerm {
 			return
 		}
@@ -520,6 +529,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = -1
 		return
 	}
+
+	rf.electionTimer.Reset(getRandms(ElectionTimeout))
 
 	if args.Term < rf.currentTerm {
 		reply.AppendEntriesState = AppendOutofDate
@@ -547,14 +558,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	rf.votedFor = args.LeaderId
 	rf.status = Follower
-	rf.electionTimer.Reset(getRandms(ElectionTimeout))
 
 	reply.AppendEntriesState = AppendNormal
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
 	if args.Entries != nil {
-		rf.logs = rf.logs[:args.PrevLogIndex]
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
 		rf.logs = append(rf.logs, args.Entries...)
 	}
 
@@ -565,6 +575,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			CommandIndex: rf.lastApplied,
 			Command:      rf.logs[rf.lastApplied].Command,
 		}
+		DPrintf("Server%v(term%v status%v) commit entry%v to state machine.", rf.me, rf.currentTerm, rf.status, applyMsg.Command)
 		rf.applyCh <- applyMsg
 		rf.commitIndex = rf.lastApplied
 	}
