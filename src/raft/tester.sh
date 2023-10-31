@@ -6,7 +6,6 @@ echo "Compiling raft.go..."
 go test -c -race
 chmod +x ./raft.test
 echo "Running test $1 for $2 iter..."
-failedIter=0
 for i in $(seq 1 "$2"); do
     echo -ne "\r$i/$2 "
     LOG="$1_$i.log"
@@ -16,9 +15,5 @@ for i in $(seq 1 "$2"); do
     else
         echo "Failed - saving log at FAILED_$LOG"
         mv "$LOG" "FAILED_$LOG"
-        $failedIter = $i
     fi
 done
-if $failedIter > 0; then 
-    echo "Failed on $failedIter"
-fi

@@ -73,7 +73,7 @@ func (rf *Raft) FormatStateOnly() string {
 const Padding = "    "
 
 func (rf *Raft) Debug(topic logTopic, format string, a ...interface{}) {
-	if debugVerbosity > 0 {
+	if debugVerbosity == 0 {
 		log.Print(rf.Sdebug(topic, format, a...))
 	}
 }
